@@ -7,7 +7,7 @@ const App = (() => {
 
   const NAV = [
     { href: '#/home', label: 'الرئيسية', icon: '🏠', show: () => true },
-    { href: '#/workers', label: 'العمال والتقدم', icon: '👥', show: u => u.role === 'admin' },
+    { href: '#/workers', label: 'العمال والتقدم', icon: '👥', show: u => !!u.scope },
     { href: '#/cert', label: 'شهادتي', icon: '🎓', show: () => true }
   ];
 
@@ -25,25 +25,16 @@ const App = (() => {
             <p>نظام تدريب عمال الرخام والحجر الطبيعي</p>
           </div>
           <form id="login-form" autocomplete="off">
-            <label>اسم المستخدم
-              <input name="username" required placeholder="مثال: sales1" autofocus>
+            <label>رقم الموظف
+              <input name="emp" required placeholder="مثال: V012" autocomplete="username" autocapitalize="characters" autofocus>
             </label>
-            <label>كلمة المرور
-              <input name="password" type="password" required placeholder="••••">
+            <label>الرمز السري (PIN)
+              <input name="pin" type="password" inputmode="numeric" required placeholder="••••••" autocomplete="current-password">
             </label>
             <div id="login-error" class="form-error" hidden></div>
             <button class="btn btn-primary btn-block" type="submit">تسجيل الدخول</button>
           </form>
-          <div class="login-hint">
-            <b>حسابات تجريبية:</b>
-            <code>admin / admin123</code> (الإدارة) &nbsp;•&nbsp;
-            <code>sales1 / 1234</code> (مبيعات) &nbsp;•&nbsp;
-            <code>store1 / 1234</code> (مستودع) &nbsp;•&nbsp;
-            <code>deliver1 / 1234</code> (تسليم) &nbsp;•&nbsp;
-            <code>account1 / 1234</code> (حسابات) &nbsp;•&nbsp;
-            <code>project1 / 1234</code> (مشاريع) &nbsp;•&nbsp;
-            <code>pallet1 / 1234</code> (باليتات)
-          </div>
+          <div class="login-hint">رقم الموظف والرمز السري يستلمهما العامل من الإدارة.</div>
         </div>
         <div class="login-side">
           <div class="side-content">
@@ -58,19 +49,18 @@ const App = (() => {
           </div>
         </div>
       </div>`;
-    document.getElementById('login-form').addEventListener('submit', e => {
+    document.getElementById('login-form').addEventListener('submit', async e => {
       e.preventDefault();
-      const f = new FormData(e.target);
-      const u = Store.login(f.get('username'), f.get('password'));
-      if (!u) {
-        const err = document.getElementById('login-error');
-        err.hidden = false;
-        err.textContent = 'بيانات الدخول غير صحيحة أو الحساب موقوف';
-        return;
+      const f = new FormData(e.target), btn = e.target.querySelector('button[type=submit]'), err = document.getElementById('login-error');
+      err.hidden = true; if (btn) btn.disabled = true;
+      try {
+        user = await Store.login(f.get('emp'), f.get('pin'));
+        location.hash = '#/home';
+        render();
+      } catch (ex) {
+        err.hidden = false; err.textContent = ex.message;
+        if (btn) btn.disabled = false;
       }
-      user = u;
-      location.hash = '#/home';
-      render();
     });
   }
 
@@ -289,29 +279,30 @@ const App = (() => {
       </section>
     `, 'اختبار: ' + m.title);
 
-    document.getElementById('quiz-submit').addEventListener('click', () => {
+    document.getElementById('quiz-submit').addEventListener('click', async e => {
       const total = m.quiz.length;
-      let answered = 0, correct = 0;
-      const detail = m.quiz.map((q, i) => {
+      let answered = 0;
+      const answers = m.quiz.map((q, i) => {
         const sel = document.querySelector(`input[name="q${i}"]:checked`);
-        if (!sel) return { ok: null };
+        if (!sel) return -1;
         answered++;
-        const ok = Number(sel.value) === q.a;
-        if (ok) correct++;
-        return { ok, user: Number(sel.value), right: q.a };
+        return Number(sel.value);
       });
       if (answered < total) { UI.toast(`أجب عن جميع الأسئلة (${answered}/${total})`, 'error'); return; }
 
-      const score = Math.round((correct / total) * 100);
-      const passed = score >= PASS_MARK;
-      Store.saveQuiz(user.id, m.id, score, total, passed);
+      const btn = e.currentTarget; btn.disabled = true;
+      let res;
+      try { res = await Store.submitQuiz(m.id, answers); }
+      catch (ex) { UI.toast(ex.message, 'error'); btn.disabled = false; return; }
+      const score = res.score, passed = res.passed, correct = res.correct.filter(Boolean).length;
+      const detail = m.quiz.map((q, i) => ({ ok: res.correct[i], user: answers[i] }));
 
       const detailHtml = m.quiz.map((q, i) => {
         const d = detail[i];
         return `
           <li class="q-res ${d.ok ? 'ok' : 'bad'}">
             <b>${d.ok ? '✓' : '✕'} ${UI.esc(q.q)}</b>
-            <span>إجابتك: ${UI.esc(q.o[d.user])}${d.ok ? '' : ` — الصحيحة: <b>${UI.esc(q.o[d.right])}</b>`}</span>
+            <span>إجابتك: ${UI.esc(q.o[d.user])}${d.ok ? '' : ' — راجع الدرس ثم أعد المحاولة'}</span>
           </li>`;
       }).join('');
 
@@ -335,7 +326,7 @@ const App = (() => {
 
   /* ---------- العمال (للإدارة) ---------- */
   function viewWorkers() {
-    if (user.role !== 'admin') { location.hash = '#/home'; return; }
+    if (!user.scope) { location.hash = '#/home'; return; }
 
     const draw = (q = '', role = '') => {
       const rows = Store.workerReport()
@@ -358,7 +349,7 @@ const App = (() => {
           <td>${UI.fmtDateTime(r.last_activity)}</td>
           <td>
             <button class="icon-btn" data-open="${r.user.id}" title="عرض المنهج">👁</button>
-            <button class="icon-btn danger" data-reset="${r.user.id}" title="إعادة تعيين التقدم">⟲</button>
+            ${user.role === 'admin' ? `<button class="icon-btn danger" data-reset="${r.user.id}" title="إعادة تعيين التقدم">⟲</button>` : ''}
           </td>
         </tr>`).join('');
 
@@ -402,9 +393,10 @@ const App = (() => {
       document.querySelectorAll('[data-reset]').forEach(b => b.addEventListener('click', () => {
         const w = Store.getUser(b.dataset.reset);
         UI.confirm(`إعادة تعيين تقدم "${w.full_name}" بالكامل؟ سيتم حذف قراءات الدروس ودرجات الاختبارات.`, () => {
-          Store.resetWorker(w.id);
-          UI.toast('تمت إعادة تعيين التقدم');
-          draw(document.getElementById('f-q').value, document.getElementById('f-role').value);
+          Store.resetWorker(w.id).then(() => {
+            UI.toast('تمت إعادة تعيين التقدم');
+            draw(document.getElementById('f-q').value, document.getElementById('f-role').value);
+          }).catch(ex => UI.toast(ex.message, 'error'));
         });
       }));
       document.querySelectorAll('[data-open]').forEach(b => b.addEventListener('click', () => {
@@ -414,6 +406,11 @@ const App = (() => {
     };
 
     draw();
+    Store.refresh().then(() => {
+      if (!location.hash.startsWith('#/workers')) return;
+      const q = document.getElementById('f-q'), r = document.getElementById('f-role');
+      draw(q ? q.value : '', r ? r.value : '');
+    }).catch(() => {});
   }
 
   function showWorkerModal(w) {
@@ -435,7 +432,7 @@ const App = (() => {
       body: `
         <div class="wm-head">
           <div><b>${UI.esc(w.full_name)}</b> (${UI.esc(ROLES[w.role])} — ${UI.esc(WAREHOUSES[w.warehouse])})</div>
-          <div>الجوال: <span dir="ltr">${UI.esc(w.phone || '—')}</span></div>
+          <div>رقم الموظف: <span dir="ltr">${UI.esc(w.username)}</span></div>
         </div>
         <div class="stat-grid small">
           <div class="stat-card"><span>الإنجاز</span><b>${st.pct}%</b></div>
@@ -512,16 +509,16 @@ const App = (() => {
   }
 
   let started = false;
-  function start() {
+  async function start() {
     if (started) { render(); return; }
     started = true;
-    Store.load();
-    user = Store.currentUser();
     window.addEventListener('hashchange', () => {
-      if (!user) user = Store.currentUser();
       if (!user) { renderLogin(); return; }
       render();
     });
+    app.innerHTML = '<div class="login-wrap"><div class="login-card"><p style="text-align:center">جاري التحميل…</p></div></div>';
+    try { user = await Store.restore(); }
+    catch (e) { UI.toast(e.message, 'error'); user = null; }
     render();
   }
 

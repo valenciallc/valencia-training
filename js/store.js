@@ -1,103 +1,79 @@
 'use strict';
 
-/* ========== التخزين (قاعدة بيانات المتصفح) ========== */
+/* ========== التخزين: خادم مشترك (Google Sheets عبر Apps Script) ==========
+   الواجهة تحتفظ بنسخة مؤقتة في الذاكرة لتبقى الدوال متزامنة، والخادم هو المرجع. */
 const Store = (() => {
-  const DB_KEY = 'valencia_training_db_v1';
-  const SESSION_KEY = 'valencia_training_session';
+  const TOKEN_KEY = 'valencia_training_token';
+  let db = { users: [], progress: {} };
+  let me = null;
 
-  let db = null;
-
-  function load() {
+  async function api(action, data = {}) {
+    if (!API_URL) throw new Error('لم يتم ربط الخادم بعد — راجع ملف js/config.js');
+    let j;
     try {
-      const raw = localStorage.getItem(DB_KEY);
-      if (raw) { db = JSON.parse(raw); return; }
-    } catch (e) { console.warn('تعذر قراءة التخزين', e); }
-    db = { users: [], progress: {}, created_at: Date.now() };
-    seed();
-    save();
-  }
-
-  function seed() {
-    db.users = SEED_USERS.map((u, i) => ({ id: i + 1, ...u, active: true, created_at: Date.now() }));
-    db.progress = {};
-  }
-
-  function save() {
-    try {
-      localStorage.setItem(DB_KEY, JSON.stringify(db));
+      const r = await fetch(API_URL, { method: 'POST', body: JSON.stringify({ action, token: localStorage.getItem(TOKEN_KEY), ...data }) });
+      j = await r.json();
     } catch (e) {
-      console.error('تعذر الحفظ', e);
-      UI.toast('تعذر الحفظ في متصفحك — قد يكون التخزين ممتلئاً', 'error');
+      throw new Error('تعذر الاتصال بالخادم، تحقق من الإنترنت وحاول مرة أخرى');
     }
+    if (!j.ok) { const e = new Error(j.error || 'حدث خطأ'); e.code = j.code; throw e; }
+    return j;
   }
 
-  function resetAll() {
-    seed();
-    save();
-    sessionStorage.removeItem(SESSION_KEY);
-  }
+  function apply(j) { me = j.me; db.users = j.users; db.progress = j.progress; }
 
   /* ---------- المصادقة ---------- */
-  function login(username, password) {
-    const u = db.users.find(x => x.username === String(username).trim().toLowerCase() && x.active !== false);
-    if (!u || u.password !== password) return null;
-    sessionStorage.setItem(SESSION_KEY, String(u.id));
-    return u;
+  async function login(emp, pin) {
+    const j = await api('login', { emp: String(emp).trim().toUpperCase(), pin: String(pin).trim() });
+    localStorage.setItem(TOKEN_KEY, j.token);
+    apply(j);
+    return me;
   }
 
-  function logout() { sessionStorage.removeItem(SESSION_KEY); }
-
-  function currentUser() {
-    const id = Number(sessionStorage.getItem(SESSION_KEY));
-    if (!id) return null;
-    return db.users.find(u => u.id === id) || null;
+  async function restore() {
+    if (!localStorage.getItem(TOKEN_KEY)) return null;
+    try { apply(await api('sync')); return me; }
+    catch (e) { if (e.code === 'auth') { logout(); return null; } throw e; }
   }
 
-  function listUsers(filter) {
-    let rows = db.users.slice();
-    if (filter) {
-      const q = (filter.q || '').trim();
-      if (q) rows = rows.filter(u => u.full_name.includes(q) || u.username.includes(q) || (u.phone || '').includes(q));
-      if (filter.role) rows = rows.filter(u => u.role === filter.role);
-      if (filter.warehouse) rows = rows.filter(u => u.warehouse === filter.warehouse);
-    }
-    return rows;
+  async function refresh() { apply(await api('sync')); }
+
+  function logout() {
+    localStorage.removeItem(TOKEN_KEY);
+    me = null; db = { users: [], progress: {} };
   }
 
-  function getUser(id) { return db.users.find(u => u.id === Number(id)) || null; }
+  function currentUser() { return me; }
+  function getUser(id) { return db.users.find(u => u.id === String(id)) || null; }
 
   /* ---------- التقدم ---------- */
-  function keyOf(userId) { return String(userId); }
+  const keyOf = id => String(id);
 
   function lessonDone(userId, lessonId) {
     return !!(db.progress[keyOf(userId)] || {})[`L:${lessonId}`];
   }
 
   function markLesson(userId, lessonId) {
+    if (lessonDone(userId, lessonId)) return;
     const k = keyOf(userId);
     db.progress[k] = db.progress[k] || {};
     db.progress[k][`L:${lessonId}`] = Date.now();
     db.progress[k].updated_at = Date.now();
-    save();
+    api('lesson', { lessonId }).catch(e => UI.toast(e.message, 'error'));
   }
 
   function quizResult(userId, moduleId) {
     return (db.progress[keyOf(userId)] || {})[`Q:${moduleId}`] || null;
   }
 
-  function saveQuiz(userId, moduleId, score, total, passed) {
-    const k = keyOf(userId);
+  /* التصحيح يتم على الخادم، والإجابات الصحيحة لا تصل للمتصفح */
+  async function submitQuiz(moduleId, answers) {
+    const j = await api('quiz', { moduleId, answers });
+    const k = keyOf(me.id);
     db.progress[k] = db.progress[k] || {};
-    const prev = db.progress[k][`Q:${moduleId}`];
-    db.progress[k][`Q:${moduleId}`] = {
-      score, total, passed,
-      tries: ((prev && prev.tries) || 0) + 1,
-      best: Math.max(score, (prev && prev.best) || 0),
-      at: Date.now()
-    };
+    db.progress[k][`Q:${moduleId}`] = j.record;
     db.progress[k].updated_at = Date.now();
-    save();
-    return db.progress[k][`Q:${moduleId}`];
+    return j;
   }
 
   function moduleState(userId, moduleId) {
@@ -132,8 +108,7 @@ const Store = (() => {
     let lessonsRead = 0, lessonsTotal = 0, scores = [], passed = 0;
     track.forEach(id => {
       const st = moduleState(userId, id);
-      const mod = MODULES.find(m => m.id === id);
-      if (!st || !mod) return;
+      if (!st) return;
       lessonsRead += st.lessons_done;
       lessonsTotal += st.lessons_total;
       if (st.quiz) { scores.push(st.quiz.best); if (st.quiz.passed) passed++; }
@@ -148,6 +123,7 @@ const Store = (() => {
     };
   }
 
+  /* التقرير: يعرض فقط من يحق للمستخدم رؤيتهم (يحدده الخادم حسب نطاق الصلاحية) */
   function workerReport() {
     return db.users.filter(u => u.active !== false).map(u => {
       const s = stats(u.id, u.role);
@@ -156,18 +132,14 @@ const Store = (() => {
     });
   }
 
-  function resetWorker(userId) {
+  async function resetWorker(userId) {
+    await api('reset', { emp: userId });
     delete db.progress[keyOf(userId)];
-    save();
-  }
-
-  function progressOfAll() {
-    return db.progress;
   }
 
   return {
-    load, save, resetAll, login, logout, currentUser,
-    listUsers, getUser, lessonDone, markLesson, quizResult, saveQuiz,
-    moduleState, trackProgress, stats, workerReport, resetWorker, progressOfAll
+    login, restore, refresh, logout, currentUser, getUser,
+    lessonDone, markLesson, quizResult, submitQuiz,
+    moduleState, trackProgress, stats, workerReport, resetWorker
   };
 })();
